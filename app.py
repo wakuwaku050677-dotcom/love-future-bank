@@ -1,208 +1,161 @@
 import streamlit as st
 import pandas as pd
-import os
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import json
 from datetime import datetime
+import time
 
-# --- Constants & Config ---
-DATA_FILE = "couple_bank.csv"
-USERS = ["阿部", "あや"]
+# ---------------------------------------------------------
+# 1. 認証とスプレッドシートへの接続（魔法の鍵）
+# ---------------------------------------------------------
+# キャッシュを使って接続を高速化
+@st.cache_resource
+def get_gspread_client():
+    # SecretsからJSONの中身を取り出す（文字列 -> 辞書に変換）
+    key_dict = json.loads(st.secrets["gcp_service_account"]["json_content"])
+    
+    # 認証スコープの設定
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
+    client = gspread.authorize(creds)
+    return client
 
-ACTIONS = {
-    "savings": {
-        "label": "💰 貯金アクション",
-        "items": [
-            {"name": "つもり貯金", "points": 100, "type": "saving"},
-            {"name": "外食我慢", "points": 300, "type": "saving"},
-        ]
-    },
-    "diet": {
-        "label": "🏃 ダイエットアクション",
-        "items": [
-            {"name": "筋トレした", "points": 50, "type": "diet"},
-            {"name": "野菜食べた", "points": 30, "type": "diet"},
-            {"name": "お菓子我慢", "points": 50, "type": "diet"},
-        ]
-    }
-}
+# スプレッドシートを開く関数
+def get_sheet():
+    client = get_gspread_client()
+    sheet_name = "future_bank_db"  # 作成したシート名
+    try:
+        sheet = client.open(sheet_name).sheet1
+        return sheet
+    except gspread.SpreadsheetNotFound:
+        st.error(f"エラー：スプレッドシート '{sheet_name}' が見つかりません。共有設定を確認してください。")
+        st.stop()
 
-TICKETS = [
-    {"name": "肩揉み10分券", "cost": 300},
-    {"name": "皿洗い免除券", "cost": 500},
-    {"name": "好きな夕飯リクエスト券", "cost": 1000},
-    {"name": "週末お出かけプラン決定権", "cost": 2000},
-]
-
-# --- Functions ---
-
+# ---------------------------------------------------------
+# 2. データの読み書き
+# ---------------------------------------------------------
 def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            return pd.read_csv(DATA_FILE)
-        except Exception:
-            return pd.DataFrame(columns=["Timestamp", "User", "Type", "Category", "Item", "Value", "Points"])
-    else:
-        return pd.DataFrame(columns=["Timestamp", "User", "Type", "Category", "Item", "Value", "Points"])
-
-def save_data(df):
-    df.to_csv(DATA_FILE, index=False)
-
-def add_entry(user, type, category, item, value, points):
-    df = load_data()
-    new_entry = pd.DataFrame([{
-        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "User": user,
-        "Type": type, # 'earn' or 'spend'
-        "Category": category, # 'saving', 'diet', 'shop'
-        "Item": item,
-        "Value": value, # Amount for savings, or 1 for count
-        "Points": points
-    }])
-    df = pd.concat([df, new_entry], ignore_index=True)
-    save_data(df)
-
-def get_balance(user):
-    df = load_data()
+    sheet = get_sheet()
+    data = sheet.get_all_records()
+    df = pd.DataFrame(data)
+    
+    # 空っぽの場合は初期化
     if df.empty:
-        return 0
-    user_data = df[df["User"] == user]
-    return user_data["Points"].sum()
+        df = pd.DataFrame(columns=["日付", "名前", "アクション", "ポイント", "内容"])
+        
+    return df
 
-def get_global_stats():
-    df = load_data()
-    if df.empty:
-        return 0, 0
+def add_log(name, action, points, note):
+    sheet = get_sheet()
+    date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     
-    # Total Savings (Value where Category is saving)
-    total_savings = df[df["Category"] == "saving"]["Value"].sum()
+    # 行を追加
+    row = [date_str, name, action, points, note]
+    sheet.append_row(row)
     
-    # Total Diet Count (Count where Category is diet)
-    total_diet = len(df[df["Category"] == "diet"])
-    
-    return total_savings, total_diet
+    # 成功メッセージ
+    st.toast(f"✅ {points}pt ゲット！ ({action})")
+    time.sleep(1) # ちょっと待ってからリロード
+    st.rerun()
 
-# --- UI ---
+# ---------------------------------------------------------
+# 3. アプリの画面構成
+# ---------------------------------------------------------
+st.set_page_config(page_title="ふたりの未来投資銀行", page_icon="🏦")
 
-st.set_page_config(page_title="ふたりの未来投資銀行", page_icon="🏦", layout="wide")
+st.title("🏦 ふたりの未来投資銀行")
+st.caption("Our Love & Future Investment Bank")
 
-# Sidebar
-st.sidebar.header("ログイン")
-current_user = st.sidebar.radio("ユーザーを選択", USERS)
+# サイドバー：ユーザー切り替え
+st.sidebar.header("👤 ログイン")
+user_name = st.sidebar.selectbox("あなたはだれ？", ["阿部", "あや"])
 
-st.sidebar.markdown("---")
-st.sidebar.markdown(f"### {current_user}さんの資産")
-current_balance = get_balance(current_user)
-st.sidebar.metric("現在のポイント", f"{current_balance} pt")
+# 現在のデータを読み込み
+df = load_data()
 
+# ポイント集計
+if not df.empty:
+    total_points = df["ポイント"].sum()
+    abe_points = df[df["名前"] == "阿部"]["ポイント"].sum()
+    aya_points = df[df["名前"] == "あや"]["ポイント"].sum()
+else:
+    total_points = 0
+    abe_points = 0
+    aya_points = 0
 
-# Main Content
-st.title("🏦 ふたりの未来投資銀行 🏦")
-st.markdown("二人の頑張りを未来への投資に！")
+# メトリクス表示（資産状況）
+col1, col2, col3 = st.columns(3)
+col1.metric("💰 二人の総資産", f"{total_points:,} pt")
+col2.metric("👨 阿部の貢献", f"{abe_points:,} pt")
+col3.metric("👩 あやの貢献", f"{aya_points:,} pt")
 
-# Global Settings / Stats
-g_savings, g_diet = get_global_stats()
-col1, col2 = st.columns(2)
-with col1:
-    st.metric("💰 ふたりの合計貯金額", f"¥{int(g_savings):,}")
-with col2:
-    st.metric("🏃 ふたりのダイエット回数", f"{g_diet} 回")
+st.divider()
 
-st.markdown("---")
+# ---------------------------------------------------------
+# 4. アクションエリア（入力）
+# ---------------------------------------------------------
+st.header(f"📝 {user_name}のアクション")
 
-tab1, tab2, tab3 = st.tabs(["💎 資産を増やす (稼ぐ)", "🎫 ご褒美ショップ (使う)", "📊 通帳を見る (履歴)"])
+tab1, tab2 = st.tabs(["💰 貯金・投資", "🏃 健康・ダイエット"])
 
 with tab1:
-    st.header(f"{current_user}さんの投資アクション")
+    st.info("未来のためにお金を残した！")
+    c1, c2, c3 = st.columns(3)
+    if c1.button("つもり貯金 (+100pt)"):
+        add_log(user_name, "つもり貯金", 100, "カフェ我慢など")
+    if c2.button("外食我慢 (+300pt)"):
+        add_log(user_name, "外食我慢", 300, "自炊した")
     
-    col_save, col_diet = st.columns(2)
-    
-    with col_save:
-        st.subheader(ACTIONS["savings"]["label"])
-        for item in ACTIONS["savings"]["items"]:
-            if st.button(f"{item['name']} (+{item['points']}pt)", key=f"save_{item['name']}"):
-                add_entry(current_user, "earn", "saving", item['name'], item['points'], item['points']) # Approximation: Value=Points for fixed items, usually cash amount
-                st.toast(f"{item['name']}を記録しました！ (+{item['points']}pt)", icon="💰")
-                st.rerun()
-        
-        # Custom Saving Input
-        with st.expander("入力をカスタマイズ (入金など)"):
-            with st.form("custom_deposit"):
-                amount = st.number_input("入金額 (円)", min_value=1, step=100)
-                submit_deposit = st.form_submit_button("入金する (+金額分pt)")
-                if submit_deposit:
-                    add_entry(current_user, "earn", "saving", "入金", amount, amount)
-                    st.toast(f"{amount}円を入金しました！ (+{amount}pt)", icon="💰")
-                    st.rerun()
-
-    with col_diet:
-        st.subheader(ACTIONS["diet"]["label"])
-        for item in ACTIONS["diet"]["items"]:
-            if st.button(f"{item['name']} (+{item['points']}pt)", key=f"diet_{item['name']}"):
-                add_entry(current_user, "earn", "diet", item['name'], 1, item['points'])
-                st.toast(f"{item['name']}を記録しました！ (+{item['points']}pt)", icon="🏃")
-                st.rerun()
-        
-        # Custom Diet Input
-        with st.expander("入力をカスタマイズ"):
-            with st.form("custom_diet"):
-                diet_desc = st.text_input("内容")
-                diet_pt = st.number_input("獲得ポイント", min_value=1, step=10)
-                submit_diet = st.form_submit_button("記録する")
-                if submit_diet and diet_desc:
-                    add_entry(current_user, "earn", "diet", diet_desc, 1, diet_pt)
-                    st.toast(f"{diet_desc}を記録しました！ (+{diet_pt}pt)", icon="🏃")
-                    st.rerun()
+    # カスタム入力
+    with st.expander("自由に入力する"):
+        custom_yen = st.number_input("貯金額（円）", min_value=0, step=100)
+        if st.button("入金する"):
+            if custom_yen > 0:
+                add_log(user_name, "入金", custom_yen, f"{custom_yen}円貯金")
 
 with tab2:
-    st.header("ご褒美チケットショップ")
-    st.markdown(f"**{current_user}**さんが、パートナーのためにチケットを購入します。")
-    st.caption("※購入するとポイントが消費されます")
-    
-    shop_cols = st.columns(2)
-    for i, ticket in enumerate(TICKETS):
-        col = shop_cols[i % 2]
-        with col:
-            with st.container(border=True):
-                st.markdown(f"#### {ticket['name']}")
-                st.markdown(f"**{ticket['cost']} pt**")
-                if st.button("購入する", key=f"buy_{i}", disabled=(current_balance < ticket['cost'])):
-                    add_entry(current_user, "spend", "shop", ticket['name'], 1, -ticket['cost'])
-                    st.balloons()
-                    st.success(f"{ticket['name']}を購入しました！")
-                    st.rerun()
-                if current_balance < ticket['cost']:
-                    st.caption("ポイント不足")
+    st.success("未来のために体をメンテナンスした！")
+    c1, c2, c3 = st.columns(3)
+    if c1.button("筋トレした (+50pt)"):
+        add_log(user_name, "筋トレ", 50, "えらい！")
+    if c2.button("野菜食べた (+30pt)"):
+        add_log(user_name, "野菜摂取", 30, "ヘルシー")
+    if c3.button("お菓子我慢 (+50pt)"):
+        add_log(user_name, "お菓子我慢", 50, "誘惑に勝った")
 
-with tab3:
-    st.header("取引履歴")
-    df = load_data()
+st.divider()
+
+# ---------------------------------------------------------
+# 5. ご褒美ショップ（チケット交換）
+# ---------------------------------------------------------
+st.header("🎟️ ご褒美ショップ")
+st.caption("貯めたポイントを使って、相手にお願いしよう！")
+
+ticket_menu = {
+    "肩揉み10分券": 300,
+    "皿洗い免除券": 500,
+    "好きな夕飯リクエスト": 1000,
+    "週末お出かけ決定権": 2000
+}
+
+selected_ticket = st.selectbox("チケットを選ぶ", list(ticket_menu.keys()))
+cost = ticket_menu[selected_ticket]
+
+if st.button(f"購入する (-{cost} pt)"):
+    # 現在のポイントをチェック（簡易版なのでマイナスも許容してますが、運用でカバー！）
+    add_log(user_name, "チケット購入", -cost, selected_ticket)
+    st.balloons()
+    st.success(f"🎉 {selected_ticket} を購入しました！相手に画面を見せてね。")
+
+st.divider()
+
+# ---------------------------------------------------------
+# 6. 通帳（履歴）
+# ---------------------------------------------------------
+with st.expander("📖 通帳を見る（履歴）"):
     if not df.empty:
-        # Latest first
-        st.dataframe(df.sort_values(by="Timestamp", ascending=False), use_container_width=True)
-        
-        st.subheader("資産推移")
-        # Simple cumulative sum for points by user
-        # This is a bit complex to do cleanly in one line with pandas, need to pivot
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-        df_sorted = df.sort_values('Timestamp')
-        
-        chart_data = pd.DataFrame()
-        for u in USERS:
-             user_df = df_sorted[df_sorted['User'] == u].copy()
-             if not user_df.empty:
-                 user_df['Cumulative Points'] = user_df['Points'].cumsum()
-                 # We need to align timestamps for a nice multi-line chart, but for simplicty, let's just plot points over time per user
-                 # A better way for Streamlit line chart is a wide format df
-                 
-        # Let's just group by Date for a simpler chart
-        df_sorted['Date'] = df_sorted['Timestamp'].dt.date
-        pivot_df = df_sorted.groupby(['Date', 'User'])['Points'].sum().groupby(level=0).cumsum().unstack().fillna(method='ffill')
-        # This pivot might be wrong for cumulative balance. 
-        # Correct approach: Calculate cumulative sum for each user, then merge or plot.
-        
-        # Simplified Chart: Just total points per category
-        st.subheader("カテゴリー別貢献度")
-        cat_chart = df[df['Points'] > 0].groupby(['User', 'Category'])['Points'].sum().unstack()
-        st.bar_chart(cat_chart)
-
+        # 新しい順に表示
+        st.dataframe(df.sort_index(ascending=False))
     else:
-        st.info("データがまだありません。")
+        st.write("まだ履歴がありません。")
